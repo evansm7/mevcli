@@ -16,7 +16,7 @@ Full line editing features (a la `readline`) is supported.
 Features:
 
 - Single-header style
-- Simple to use/incorporate
+- Trivial to incorporate into a project
 - ANSI cursor/navigation support, including `^A`/`^E` for start/end of line and `^←`/`^→` word-skip
  - `^W`/`^U` word/line cut
 - 100% static allocation / no dynamic allocation required
@@ -36,6 +36,52 @@ make -C test
 ./test/test
 ```
 
+Interacting with `test` then looks a bit like this:
+
+```
+test> 
+test> ?
+
+Unknown command.  Commands are:
+
+	prback <args...>	Print args backwards
+	prcaps <a> <b>		Print both args IN CAPS
+	special				Enter special mode
+	unspecial			Exit special mode
+	quit				Quit back to sanity
+
+
+	[ You can navigate a line using cursors (use them with CTRL
+	  to navigate by word), and ^A/^E to skip to the start/end.
+	  Erase by word (^W), or to line start (^U) are also supported. ]
+test> 
+test> prback 1 2 3
+Got 3 args.  In reverse order, they are: '3' '2' '1' 
+test>    prback  wevw ioijasofija dsfsdf   s
+Got 4 args.  In reverse order, they are: 's' 'dsfsdf' 'ioijasofija' 'wevw' 
+test> 
+test>  prcaps one_arg_oops
+
+Command args are incorrect.  Commands are:
+
+	prback <args...>	Print args backwards
+	prcaps <a> <b>		Print both args IN CAPS
+	special				Enter special mode
+	unspecial			Exit special mode
+	quit				Quit back to sanity
+
+
+	[ You can navigate a line using cursors (use them with CTRL
+	  to navigate by word), and ^A/^E to skip to the start/end.
+	  Erase by word (^W), or to line start (^U) are also supported. ]
+test> 
+test>   special
+specialmode> unspecial
+test> 
+test> quit
+```
+
+Note whitespace is ignored, and a chopped-up array of args is passed to a command handler.  The prompt can be dynamic, and here a pair of commands change/restore it.  Also, input is checked for the correct number of args for a given command (where fixed).
 
 # Licence
 

@@ -93,7 +93,7 @@ static void cmd_special(void *opaque, int argc, char **argv)
 const mevcli_cmd_t cmds[] = {
 	/* Two similar commands to demonstrate tab-completion */
 	{ .name = "prback",
-	  .help = " args...>\t\tPrint args backwards",
+	  .help = " <args...>\tPrint args backwards",
 	  .cmdfn = cmd_pback,
 	  .nargs = -1,
 	},
