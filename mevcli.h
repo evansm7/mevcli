@@ -55,10 +55,6 @@
 ////////////////////////////////////////////////////////////////////////////////
 // Config: can be overridden by the application before #including this
 
-#ifndef MEVCLI_HISTORY_LEN
-#define MEVCLI_HISTORY_LEN		0	/* Number of lines of history to store */
-#endif
-
 #ifndef MEVCLI_MAX_LINE_LEN
 #define MEVCLI_MAX_LINE_LEN		78	/* Chars per line, beyond prompt */
 #endif
@@ -71,13 +67,30 @@
 #define MEVCLI_PROMPT			"> "	/* Prompt; could be set to a char* variable */
 #endif
 
-#ifndef MEVCLI_ASSERT
-#define MEVCLI_ASSERT(x)		do {} while(0)
+#ifndef MEVCLI_FEAT_HISTORY
+#define MEVCLI_FEAT_HISTORY		1
 #endif
 
-#if MEVCLI_HISTORY_LEN > 0
-/* FIXME: This'll get done next. :) */
-#error "Mevcli doesn't yet support command history"
+#if MEVCLI_FEAT_HISTORY
+#ifndef MEVCLI_HISTORY_BUFLEN
+#define MEVCLI_HISTORY_BUFLEN		512	/* Bytes to spend on history buffer */
+#endif
+
+#if MEVCLI_HISTORY_BUFLEN <= MEVCLI_MAX_LINE_LEN
+#error "mevcli: Config MEVCLI_HISTORY_BUFLEN needs to be at least MEVCLI_MAX_LINE_LEN"
+#endif
+
+#ifndef MEVCLI_HISTORY_MAX_STRS
+/* This configures the maximum number of history strings; we assume most history
+ * entries won't be full line-length entries, but similarly don't want too many
+ * of these pointers going unused.
+ */
+#define MEVCLI_HISTORY_MAX_STRS		((unsigned int)MEVCLI_HISTORY_BUFLEN/MEVCLI_MAX_LINE_LEN*3)
+#endif
+#endif
+
+#ifndef MEVCLI_ASSERT
+#define MEVCLI_ASSERT(x)		do {} while(0)
 #endif
 
 
@@ -178,6 +191,31 @@ typedef struct mevcli_ctx {
 
 	/* Storage for argv pointers */
 	char *args[MEVCLI_MAX_ARGS];
+
+#if MEVCLI_FEAT_HISTORY
+	/* History chars buffer */
+	char history[MEVCLI_HISTORY_BUFLEN];
+
+	/* Currently-edited line backup buffer */
+	char backup_line[MEVCLI_MAX_LINE_LEN + 1];
+	unsigned int backup_linepos;
+
+	/* Length of strings packed back to back from start of history
+	 * buffer, 0 for invalid.
+	 */
+	unsigned int history_strlens[MEVCLI_HISTORY_MAX_STRS];
+
+	/* Highest index of history_strlens with a valid line,
+	 * or -1 for none (saves searching in several places).
+	 */
+	int history_strlens_topvalid;
+
+	/* When navigating up/down through history buffer, this
+	 * gives the current entry.  -1 means we're doing a
+	 * regular line edit and not browsing history.
+	 */
+	int cur_hist_browse_idx;
+#endif
 } mevcli_ctx_t;
 
 
@@ -256,6 +294,107 @@ static void	mevcli_ansi_cursorpos(mevcli_ctx_t *ctx, unsigned int x)
 }
 
 
+///////////////////////// History management ///////////////////////////////////
+
+static int	mevcli_strlen(const char *str)
+{
+	int l = 0;
+	while (*str) { str++; l++; }
+	return l;
+}
+
+/* Add the given commandline to history (i.e. push to most recent).
+ *
+ * This shuffles memory around; performance isn't a concern, but using
+ * memory efficiently _is_.
+ *
+ * The ctx->history buffer contains a sequence of ctx->histlen
+ * zero-terminated strings back to back from byte 0 up; ctx->histlen
+ * lists the lengths including terminator (from newest to oldest).
+ */
+static void	mevcli_history_append(mevcli_ctx_t *ctx, const char *last_cmd)
+{
+#if MEVCLI_FEAT_HISTORY
+	int len = mevcli_strlen(last_cmd) + 1;
+
+	/* The history buffer is newest lowest.	 So, we're going to
+	 * copy all existing lines upwards to make space for the
+	 * newest at the start.	 Count total lengths; if remainder is
+	 * too small we'll have to drop one or more to make room.
+	 *
+	 * FIXME: The buffer currently contains terminated strings.
+	 * However, since we also keep a running count of the length
+	 * of all valid strings in history_strlens, we could do away
+	 * with the terminators.
+	 */
+
+	int total_histlen = 0;
+	int highest_copyable = -1;
+	int highest_copyable_starts_at = 0;
+	for (int i = 0; i < MEVCLI_HISTORY_MAX_STRS; i++) {
+		if (ctx->history_strlens[i] == 0)
+			break;
+		int new_total_histlen = total_histlen + ctx->history_strlens[i];
+		if (((int)MEVCLI_HISTORY_BUFLEN - new_total_histlen) >= len) {
+			highest_copyable = i;
+			highest_copyable_starts_at = total_histlen;
+		}
+		total_histlen = new_total_histlen;
+	}
+
+	if (highest_copyable >= 0) {
+		/* If valid, highest_copyable gives the oldest history
+		 * string that'll be copied.  Starting there, and
+		 * heading downwards, copy strings upwards by 'len'
+		 * bytes:
+		 */
+		int start = highest_copyable_starts_at;
+
+		for (int i = highest_copyable; i >= 0; i--) {
+			unsigned int clen = ctx->history_strlens[i];
+
+			for (int j = clen - 1; j >= 0; j--) {
+				ctx->history[start + len + j] = ctx->history[start + j];
+			}
+			if (i > 0)
+				start -= ctx->history_strlens[i - 1];
+
+			if (i < (MEVCLI_HISTORY_MAX_STRS - 1)) {
+				ctx->history_strlens[i + 1] = clen;
+			}
+			/* else, if on the oldest possible string getting older,
+			 * it gets lost.
+			 */
+		}
+		ctx->history_strlens_topvalid = highest_copyable <
+			(MEVCLI_HISTORY_MAX_STRS - 1) ?
+			highest_copyable + 1 :
+			highest_copyable;
+	} else {
+		ctx->history_strlens_topvalid = 0;
+	}
+	if (highest_copyable < (MEVCLI_HISTORY_MAX_STRS - 2)) {
+		/* We had more indices spare than bytes to store large strings;
+		 * terminate the list of indices.  NOTE: this also works if
+		 * no history copy-up occurred (i.e. highest_copyable = -1)
+		 */
+		ctx->history_strlens[highest_copyable + 2] = 0;
+	}
+
+	/* Finally, copy the new string in: */
+	for (int i = 0; i < len; i++) {
+		ctx->history[i] = last_cmd[i];
+	}
+	ctx->history_strlens[0] = len;
+
+	/* Convenient to do this here: a command was entered, so treat
+	 * history-browsing as done:
+	 */
+	ctx->cur_hist_browse_idx = -1;
+#endif
+}
+
+
 ///////////////////////// Command execution ////////////////////////////////////
 
 static void	mevcli_help(mevcli_ctx_t *ctx, const char *why)
@@ -323,6 +462,8 @@ static void	mevcli_process_cmd(mevcli_ctx_t *ctx)
 
 	char *command = &ctx->line[command_idx];
 
+	mevcli_history_append(ctx, command);
+
 	/* Plonk terminators between each word: */
 	int aftercmd_idx = -1;
 	for (unsigned int i = command_idx; i < ctx->linepos; i++) {
@@ -386,15 +527,109 @@ out:
 
 ///////////////////////// Cursor movement //////////////////////////////////////
 
+static void	mevcli_line_redraw(mevcli_ctx_t *ctx)
+{
+	mevcli_ansi_cursorpos(ctx, ctx->prompt_len);
+	mevcli_ansi_eraseright(ctx);
+	for (unsigned int i = 0; i < ctx->linepos; i++) {
+		mevcli_putch(ctx, ctx->line[i]);
+	}
+	mevcli_ansi_cursorpos(ctx, ctx->prompt_len + ctx->cursorpos);
+}
+
+static void	mevcli_cpy(char *dest, char *src, unsigned int len)
+{
+	for (unsigned int i = 0; i < len; i++)
+		dest[i] = src[i];
+}
+
+#if MEVCLI_FEAT_HISTORY
+/* The UI here is:
+ * - Type away, edit stuff in current line
+ * - Can hit up (then up/down) to browse history;
+ *   in effect this copies a historic line into the current,
+ *   so it can be further edited, then entered
+ * - If you change your mind, hitting down all the way
+ *   returns you to the original current line-in-progress
+ *
+ * To do this, we need to back up the current line (somewhere other
+ * than history, since it might not ever be entered) so as to return
+ * to it later if necessary.
+ */
+
+static unsigned int	mevcli_history_copy_browsed_line(mevcli_ctx_t *ctx)
+{
+	/* Find the line corresponding to cur_hist_browse_idx, and
+	 * copy it to the current line buffer:
+	 */
+	int total_histlen = 0;
+	for (int i = 0; i < ctx->cur_hist_browse_idx ; i++) {
+		MEVCLI_ASSERT(ctx->history_strlens[i] != 0);
+		total_histlen += ctx->history_strlens[i];
+	}
+	unsigned int linelen = ctx->history_strlens[ctx->cur_hist_browse_idx] - 1;
+	mevcli_cpy(ctx->line, &ctx->history[total_histlen], linelen);
+
+	return linelen;
+}
+
 static void	mevcli_cursor_up(mevcli_ctx_t *ctx)
 {
-	/* FIXME: Implement when we do history */
+	if (ctx->cur_hist_browse_idx == ctx->history_strlens_topvalid) {
+		/* This includes the case where history_strlens_topvalid == -1
+		 * just after init.
+		 */
+		mevcli_putch(ctx, MEVCLI_BELL_CHAR); /* BOOP! */
+		return;
+	}
+
+	if (ctx->cur_hist_browse_idx == -1) {
+		mevcli_cpy(ctx->backup_line, ctx->line, ctx->linepos);
+		ctx->backup_linepos = ctx->linepos;
+	}
+	ctx->cur_hist_browse_idx++;
+
+	unsigned int linelen = mevcli_history_copy_browsed_line(ctx);
+	ctx->linepos = linelen;
+	ctx->cursorpos = linelen;
+
+	mevcli_line_redraw(ctx);
 }
 
 static void	mevcli_cursor_down(mevcli_ctx_t *ctx)
 {
-	/* FIXME: Implement when we do history */
+	if (ctx->cur_hist_browse_idx == -1) {
+		mevcli_putch(ctx, MEVCLI_BELL_CHAR); /* BOOP! */
+		return;
+	}
+
+	if (ctx->cur_hist_browse_idx == 0) {
+		/* Restore edit buffer; the user didn't like that
+		 * history experience.
+		 */
+		mevcli_cpy(ctx->line, ctx->backup_line, ctx->backup_linepos);
+		ctx->linepos = ctx->backup_linepos;
+		ctx->cursorpos = ctx->backup_linepos;
+		ctx->cur_hist_browse_idx = -1;
+	} else {
+		ctx->cur_hist_browse_idx--;
+
+		unsigned int linelen = mevcli_history_copy_browsed_line(ctx);
+		ctx->linepos = linelen;
+		ctx->cursorpos = linelen;
+	}
+
+	mevcli_line_redraw(ctx);
 }
+#else
+static void	mevcli_cursor_up(mevcli_ctx_t *ctx)
+{
+}
+static void	mevcli_cursor_down(mevcli_ctx_t *ctx)
+{
+}
+#endif
+
 
 static void	mevcli_cursor_right(mevcli_ctx_t *ctx)
 {
@@ -671,6 +906,14 @@ void	mevcli_init(mevcli_ctx_t *ctx, const mevcli_cmd_t *cmds, unsigned int num_c
 	ctx->cb_output_char = cb_output_char;
 	ctx->csi_fsm_state = 0;
 	ctx->cursorpos = ctx->linepos = 0;
+
+#if MEVCLI_FEAT_HISTORY
+	for (int i = 0; i < MEVCLI_HISTORY_MAX_STRS; i++)
+		ctx->history_strlens[i] = 0;
+
+	ctx->history_strlens_topvalid = -1;
+	ctx->cur_hist_browse_idx = -1;
+#endif
 
 	mevcli_prompt(ctx);
 }
